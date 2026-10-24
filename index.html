@@ -26,6 +26,7 @@
 }
 :root[data-theme="dark"]{color-scheme:dark;--bg:#10152A;--surface:#1A2140;--ink:#E9ECF5;--muted:#9AA3BF;--line:#2C3559;--accent:#A08CFF;--bought:#4CC38A;--gone:#7D84A0;--danger:#FF6B6F}
 *,*::before,*::after{box-sizing:border-box}
+[hidden]{display:none!important}
 html{scroll-padding-top:env(safe-area-inset-top,0px)}
 body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 Onest,system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-tap-highlight-color:transparent}
 .wrap{max-width:600px;margin:0 auto;padding:20px 16px 120px}
@@ -81,6 +82,9 @@ button:focus-visible,input:focus-visible,.body:focus-visible{outline:2px solid v
 .hint{font-size:13px;color:var(--muted);margin-top:18px}
 .backup{margin-top:28px;font-size:13px;color:var(--muted)}
 .backup .btn{font-size:15px;padding:11px}
+.backup a{color:var(--accent)}
+.sync{margin-top:24px;padding-top:18px;border-top:1px solid var(--line)}
+.sync h2{font:600 15px Onest,sans-serif;color:var(--ink);margin:0 0 6px}
 </style>
 </head>
 <body>
@@ -96,10 +100,20 @@ button:focus-visible,input:focus-visible,.body:focus-visible{outline:2px solid v
   </section>
   <section id="viewHist" class="hist" hidden><ol id="hist"></ol>
     <div class="backup">
-      <p>Список хранится только на этом телефоне. Время от времени сохраняй копию, чтобы не потерять его, если удалишь приложение.</p>
+      <p id="bkText"></p>
       <div class="actions"><button type="button" class="btn ghost" id="exp">Сохранить копию</button><button type="button" class="btn ghost" id="imp">Восстановить</button></div>
       <input type="file" id="impFile" accept=".json,application/json" hidden>
       <p class="num" id="bkMsg" role="status"></p>
+      <div class="sync">
+        <h2>Синхронизация</h2>
+        <div id="syncSetup">
+          <p>Чтобы список был на всех устройствах, создай на GitHub <a href="https://github.com/settings/tokens/new?scopes=gist&amp;description=%D0%A5%D0%BE%D1%82%D0%B5%D0%BB%D0%BA%D0%B8" target="_blank" rel="noopener">токен с доступом gist</a> и вставь его сюда. На другом устройстве вставь тот же токен — список подтянется и сольётся.</p>
+          <div class="f"><label for="syncToken">Токен GitHub</label><input id="syncToken" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="ghp_…"></div>
+          <div class="actions"><button type="button" class="btn ghost" id="syncConnect">Подключить</button></div>
+        </div>
+        <div class="actions" id="syncActions" hidden><button type="button" class="btn ghost" id="syncNow">Синхронизировать</button><button type="button" class="btn ghost" id="syncOff">Отключить</button></div>
+        <p class="num" id="syncMsg" role="status"></p>
+      </div>
     </div>
   </section>
 </div>
@@ -121,9 +135,12 @@ button:focus-visible,input:focus-visible,.body:focus-visible{outline:2px solid v
 </div>
 
 <script>
-const KEY='wishes-v1';
-let state={items:[]}; // {id,name,price,addedAt,status:'want'|'bought'|'gone',closedAt}
-let editing=null;
+const KEY='wishes-v1',SYNC_KEY='hotelki-sync',GIST_FILE='hotelki.json';
+// items: {id,name,price,addedAt,status:'want'|'bought'|'gone',closedAt,pos,updatedAt}
+// deleted items stay as tombstones {id,deleted:true,updatedAt} so sync doesn't bring them back
+let state={v:2,items:[]};
+let editing=null; // id
+let dragging=false,renderLater=false;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const parseNum=s=>{const n=parseFloat(String(s).replace(/\s/g,'').replace(',','.'));return isFinite(n)&&n>0?n:0};
@@ -140,16 +157,41 @@ function dur(ms){
 }
 const fmtDate=t=>new Date(t).toLocaleDateString('ru-RU',{day:'numeric',month:'long',year:new Date(t).getFullYear()===new Date().getFullYear()?undefined:'numeric'});
 
-function load(){try{const s=localStorage.getItem(KEY);if(s){const v=JSON.parse(s);if(v&&Array.isArray(v.items))state=v}}catch(e){}}
-function persist(){
-  try{localStorage.setItem(KEY,JSON.stringify(state))}catch(e){}
+function norm(it){
+  if(it.deleted)return {id:String(it.id),deleted:true,updatedAt:+it.updatedAt||0};
+  // unknown fields are kept so an older app version on another device doesn't drop them on sync
+  return {...it,id:String(it.id),name:String(it.name??''),price:+it.price||0,addedAt:+it.addedAt||Date.now(),
+    status:['want','bought','gone'].includes(it.status)?it.status:'want',closedAt:it.closedAt?+it.closedAt:null,
+    pos:+it.pos||0,updatedAt:+it.updatedAt||0};
 }
+// v1 had no pos/updatedAt: order was the array order, deleted items were simply removed
+function migrate(v){
+  if(!v||!Array.isArray(v.items))return null;
+  const items=v.items.filter(it=>it&&it.id!=null).map((it,i)=>norm(v.v>=2?it:{...it,pos:i,updatedAt:it.closedAt||it.addedAt}));
+  return {v:2,items};
+}
+function load(){
+  try{
+    const s=localStorage.getItem(KEY);if(!s)return;
+    const raw=JSON.parse(s),v=migrate(raw);if(!v)return;
+    state=v;
+    if(!(raw.v>=2)){localStorage.setItem(KEY+'-before-sync',s);save()}
+  }catch(e){}
+}
+function save(){try{localStorage.setItem(KEY,JSON.stringify(state))}catch(e){}}
+function persist(){save();scheduleSync()}
+const live=()=>state.items.filter(i=>!i.deleted);
+const byId=id=>state.items.find(i=>i.id===id);
+const touch=it=>{it.updatedAt=Date.now()};
+const wantItems=()=>live().filter(i=>i.status==='want').sort((a,b)=>a.pos-b.pos);
+const nextPos=()=>{const w=wantItems();return w.length?w[w.length-1].pos+1:0};
 
 const grip='<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><circle cx="5" cy="3" r="1.5"/><circle cx="11" cy="3" r="1.5"/><circle cx="5" cy="8" r="1.5"/><circle cx="11" cy="8" r="1.5"/><circle cx="5" cy="13" r="1.5"/><circle cx="11" cy="13" r="1.5"/></svg>';
 
 function render(){
-  const want=state.items.filter(i=>i.status==='want');
-  const hist=state.items.filter(i=>i.status!=='want').sort((a,b)=>b.closedAt-a.closedAt);
+  if(dragging){renderLater=true;return}
+  const want=wantItems();
+  const hist=live().filter(i=>i.status!=='want').sort((a,b)=>b.closedAt-a.closedAt);
   $('cWant').textContent=want.length?' '+want.length:'';
   $('cHist').textContent=hist.length?' '+hist.length:'';
   $('hint').hidden=want.length<2;
@@ -162,8 +204,8 @@ function render(){
       <div class="body" tabindex="0"><div class="name">${esc(it.name)}</div>
         <div class="meta num">${it.price?`<span>${money(it.price)}</span>`:''}<span>хочу ${dur(Date.now()-it.addedAt)}</span></div></div>
       <div class="acts"><button class="chip buy">Купил</button><button class="chip gone">Перехотел</button></div>`;
-    li.querySelector('.body').addEventListener('click',()=>openSheet(it));
-    li.querySelector('.body').addEventListener('keydown',e=>{if(e.key==='Enter')openSheet(it)});
+    li.querySelector('.body').addEventListener('click',()=>openSheet(it.id));
+    li.querySelector('.body').addEventListener('keydown',e=>{if(e.key==='Enter')openSheet(it.id)});
     li.querySelector('.buy').onclick=()=>close(it,'bought');
     li.querySelector('.gone').onclick=()=>close(it,'gone');
     setupDrag(li,li.querySelector('.handle'));
@@ -179,26 +221,30 @@ function render(){
       <div class="meta num"><span class="badge ${b?'b':'g'}">${b?'Купил':'Перехотел'} ${fmtDate(it.closedAt)}</span>${it.price?`<span>${money(it.price)}</span>`:''}<span>хотел ${dur(it.closedAt-it.addedAt)}</span></div></div>
       <button class="chip">Вернуть</button>`;
     li.querySelector('.chip').onclick=()=>{
-      it.status='want';it.closedAt=null;
-      state.items=state.items.filter(x=>x!==it);state.items.push(it);persist();render();
+      it.pos=nextPos();it.status='want';it.closedAt=null;touch(it);persist();render();
     };
     hl.appendChild(li);
   });
 }
 
-function close(it,status){it.status=status;it.closedAt=Date.now();persist();render()}
+function close(it,status){it.status=status;it.closedAt=Date.now();touch(it);persist();render()}
 
-function saveOrderFromDom(){
-  const ids=[...$('list').querySelectorAll('.item')].map(li=>li.dataset.id);
-  const want=ids.map(id=>state.items.find(i=>i.id===id));
-  state.items=want.concat(state.items.filter(i=>i.status!=='want'));
+// Only the moved item gets a new pos (between its neighbours), so concurrent moves on other devices merge
+function saveOrder(li){
+  const it=byId(li.dataset.id),p=li.previousElementSibling,n=li.nextElementSibling;
+  const pp=p&&byId(p.dataset.id).pos,np=n&&byId(n.dataset.id).pos;
+  if((!p||pp<it.pos)&&(!n||it.pos<np))return;
+  const pos=p&&n?(pp+np)/2:p?pp+1:n?np-1:0;
+  if(p&&n&&!(pp<pos&&pos<np)){
+    [...$('list').children].forEach((el,i)=>{const x=byId(el.dataset.id);x.pos=i;touch(x)});
+  }else{it.pos=pos;touch(it)}
   persist();
 }
 
 function setupDrag(li,h){
   let active=false;
   h.addEventListener('pointerdown',e=>{
-    active=true;h.setPointerCapture(e.pointerId);li.classList.add('drag');e.preventDefault();
+    active=dragging=true;h.setPointerCapture(e.pointerId);li.classList.add('drag');e.preventDefault();
   });
   h.addEventListener('pointermove',e=>{
     if(!active)return;
@@ -209,16 +255,20 @@ function setupDrag(li,h){
     while(n&&y>n.getBoundingClientRect().top+n.offsetHeight/2){li.parentNode.insertBefore(n,li);n=li.nextElementSibling}
     if(y<60)window.scrollBy(0,-8);else if(y>innerHeight-90)window.scrollBy(0,8);
   });
-  const end=()=>{if(!active)return;active=false;li.classList.remove('drag');saveOrderFromDom()};
+  const end=()=>{
+    if(!active)return;active=dragging=false;li.classList.remove('drag');saveOrder(li);
+    if(renderLater){renderLater=false;render()}
+  };
   h.addEventListener('pointerup',end);h.addEventListener('pointercancel',end);
   h.addEventListener('keydown',e=>{
-    if(e.key==='ArrowUp'&&li.previousElementSibling){li.parentNode.insertBefore(li,li.previousElementSibling);h.focus();saveOrderFromDom();e.preventDefault()}
-    if(e.key==='ArrowDown'&&li.nextElementSibling){li.parentNode.insertBefore(li.nextElementSibling,li);h.focus();saveOrderFromDom();e.preventDefault()}
+    if(e.key==='ArrowUp'&&li.previousElementSibling){li.parentNode.insertBefore(li,li.previousElementSibling);h.focus();saveOrder(li);e.preventDefault()}
+    if(e.key==='ArrowDown'&&li.nextElementSibling){li.parentNode.insertBefore(li.nextElementSibling,li);h.focus();saveOrder(li);e.preventDefault()}
   });
 }
 
-function openSheet(it){
-  editing=it||null;
+function openSheet(id){
+  const it=id&&byId(id);
+  editing=it?id:null;
   $('sheetTitle').textContent=it?'Изменить':'Новая хотелка';
   $('fName').value=it?it.name:'';$('fPrice').value=it&&it.price?it.price:'';
   $('del').hidden=!it;$('err').textContent='';
@@ -229,14 +279,22 @@ $('add').onclick=()=>openSheet();
 $('cancel').onclick=closeSheet;
 $('bd').addEventListener('click',e=>{if(e.target===$('bd'))closeSheet()});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeSheet()});
-$('del').onclick=()=>{state.items=state.items.filter(i=>i!==editing);persist();closeSheet();render()};
+$('del').onclick=()=>{
+  state.items=state.items.map(i=>i.id===editing?{id:i.id,deleted:true,updatedAt:Date.now()}:i);
+  persist();closeSheet();render();
+};
 $('form').addEventListener('submit',e=>{
   e.preventDefault();
   const name=$('fName').value.trim();
   if(!name){$('err').textContent='Напиши, что хочешь.';return}
   const price=parseNum($('fPrice').value);
-  if(editing){editing.name=name;editing.price=price}
-  else state.items.push({id:uid(),name,price,addedAt:Date.now(),status:'want',closedAt:null});
+  if(editing){
+    const it=byId(editing); // may have been deleted on another device meanwhile
+    if(it&&!it.deleted){it.name=name;it.price=price;touch(it)}
+  }else{
+    const now=Date.now();
+    state.items.push({id:uid(),name,price,addedAt:now,status:'want',closedAt:null,pos:nextPos(),updatedAt:now});
+  }
   persist();closeSheet();render();
 });
 
@@ -263,17 +321,104 @@ $('imp').onclick=()=>$('impFile').click();
 $('impFile').onchange=async e=>{
   const f=e.target.files[0];if(!f)return;
   try{
-    const v=JSON.parse(await f.text());
-    if(!v||!Array.isArray(v.items))throw 0;
-    if(state.items.length&&!confirm('Заменить текущий список на копию?'))return;
-    state=v;persist();render();$('bkMsg').textContent='Восстановлено: '+v.items.length+' шт.';
+    const v=migrate(JSON.parse(await f.text()));
+    if(!v)throw 0;
+    if(live().length&&!confirm('Заменить текущий список на копию?'))return;
+    state=v;persist();render();$('bkMsg').textContent='Восстановлено: '+live().length+' шт.';
   }catch(err){$('bkMsg').textContent='Это не файл копии «Хотелок». Выбери файл hotelki-….json.'}
   e.target.value='';
 };
 
+// Sync: the list lives in localStorage; when online it is merged with a secret gist (last change of each item wins)
+const syncCfg=()=>{try{return JSON.parse(localStorage.getItem(SYNC_KEY))}catch(e){return null}};
+const setSyncCfg=c=>{try{c?localStorage.setItem(SYNC_KEY,JSON.stringify(c)):localStorage.removeItem(SYNC_KEY)}catch(e){}};
+let syncing=false,syncAgain=false,syncTimer=0;
+
+async function gh(path,token,opts={}){
+  // Unique GET URLs: the v1 service worker cached every GET until the new one takes over
+  const url='https://api.github.com'+path+(opts.method?'':(path.includes('?')?'&':'?')+'_='+Date.now());
+  const r=await fetch(url,{...opts,cache:'no-store',headers:{Authorization:'Bearer '+token,Accept:'application/vnd.github+json',...(opts.body&&{'Content-Type':'application/json'})}});
+  if(!r.ok){const e=new Error('github');e.status=r.status;throw e}
+  return r.json();
+}
+const canon=it=>JSON.stringify(it,Object.keys(it).sort());
+const sortedJson=items=>items.map(norm).sort((a,b)=>a.id<b.id?-1:a.id>b.id?1:0).map(canon).join('\n');
+function merge(a,b){
+  const m=new Map();
+  for(const it of a.concat(b)){
+    const x=norm(it),y=m.get(x.id);
+    if(!y||x.updatedAt>y.updatedAt||(x.updatedAt===y.updatedAt&&canon(x)>canon(y)))m.set(x.id,x);
+  }
+  return [...m.values()];
+}
+const gistFiles=items=>({[GIST_FILE]:{content:JSON.stringify({v:2,items},null,1)}});
+
+function scheduleSync(delay=1500){if(!syncCfg())return;clearTimeout(syncTimer);syncTimer=setTimeout(runSync,delay)}
+async function runSync(){
+  const cfg=syncCfg();if(!cfg)return;
+  if(syncing){syncAgain=true;return}
+  if(!navigator.onLine){syncMsg('Нет сети — синхронизирую, когда появится.');return}
+  syncing=true;syncMsg('Синхронизирую…');
+  try{
+    const g=await gh('/gists/'+cfg.gistId,cfg.token);
+    const f=g.files&&g.files[GIST_FILE];
+    let remote=[];
+    if(f){
+      const text=f.truncated?await (await fetch(f.raw_url,{cache:'no-store'})).text():f.content;
+      const v=migrate(JSON.parse(text));if(v)remote=v.items;
+    }
+    const merged=merge(state.items,remote);
+    if(sortedJson(merged)!==sortedJson(state.items)){state.items=merged;save();render()}
+    if(sortedJson(merged)!==sortedJson(remote))await gh('/gists/'+cfg.gistId,cfg.token,{method:'PATCH',body:JSON.stringify({files:gistFiles(merged)})});
+    setSyncCfg({...cfg,lastSync:Date.now()});
+    syncMsg('Синхронизировано в '+new Date().toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})+'.');
+  }catch(e){
+    syncMsg(e.status===401?'GitHub не принял токен. Отключи синхронизацию и подключи заново с новым токеном.'
+      :e.status===404?'Не нашёл gist с хотелками. Отключи синхронизацию и подключи заново.'
+      :e.status?'GitHub ответил ошибкой, попробую позже.'
+      :'Нет сети — синхронизирую, когда появится.');
+  }finally{
+    syncing=false;
+    if(syncAgain){syncAgain=false;scheduleSync(0)}
+  }
+}
+// Another device with the same token finds the same gist by its file name
+async function connectSync(token){
+  const list=await gh('/gists?per_page=100',token);
+  let g=list.find(x=>x.files&&x.files[GIST_FILE]);
+  if(!g)g=await gh('/gists',token,{method:'POST',body:JSON.stringify({description:'Хотелки — данные приложения',public:false,files:gistFiles(state.items)})});
+  setSyncCfg({token,gistId:g.id});
+}
+
+function syncMsg(t){$('syncMsg').textContent=t}
+function renderSync(){
+  const on=!!syncCfg();
+  $('syncSetup').hidden=on;$('syncActions').hidden=!on;
+  $('bkText').textContent=on
+    ?'Список синхронизируется между устройствами через твой GitHub Gist. Копию всё равно полезно иногда сохранять.'
+    :'Список хранится только на этом устройстве. Время от времени сохраняй копию, чтобы не потерять его, если удалишь приложение.';
+}
+$('syncConnect').onclick=async()=>{
+  const token=$('syncToken').value.trim();
+  if(!token){syncMsg('Вставь токен.');return}
+  $('syncConnect').disabled=true;syncMsg('Подключаю…');
+  try{await connectSync(token);$('syncToken').value='';renderSync();await runSync()}
+  catch(e){syncMsg(e.status===401?'GitHub не принял токен. Проверь, что он скопирован целиком и у него есть доступ gist.'
+    :e.status?'GitHub ответил ошибкой '+e.status+'. Попробуй ещё раз.':'Нет сети. Подключи, когда появится интернет.')}
+  finally{$('syncConnect').disabled=false}
+};
+$('syncNow').onclick=()=>runSync();
+$('syncOff').onclick=()=>{
+  if(!confirm('Отключить синхронизацию на этом устройстве? Список останется здесь и в Gist.'))return;
+  setSyncCfg(null);renderSync();syncMsg('');
+};
+renderSync();
+scheduleSync(0);
+addEventListener('online',()=>scheduleSync(0));
+
 if('serviceWorker' in navigator){addEventListener('load',()=>navigator.serviceWorker.register('sw.js').catch(()=>{}))}
-// Refresh "хочу N дней" when the app comes back to the foreground
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)render()});
+// Refresh "хочу N дней" and pull changes from other devices when the app comes back to the foreground
+document.addEventListener('visibilitychange',()=>{if(!document.hidden){render();scheduleSync(0)}});
 </script>
 </body>
 </html>

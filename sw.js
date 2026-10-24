@@ -1,5 +1,5 @@
 // Офлайн-кэш «Хотелок». При изменении файлов увеличь номер версии.
-const CACHE = 'hotelki-v1';
+const CACHE = 'hotelki-v2';
 const CORE = ['./', 'index.html', 'manifest.json', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {
@@ -16,6 +16,8 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;
   const url = new URL(e.request.url);
+  // Кэшируем только своё и шрифты; запросы синхронизации к GitHub всегда идут в сеть
+  if (url.origin !== location.origin && !/^fonts\.(googleapis|gstatic)\.com$/.test(url.hostname)) return;
   // Сама страница: сначала сеть (чтобы подтягивались обновления), без сети — кэш
   if (e.request.mode === 'navigate') {
     e.respondWith(
